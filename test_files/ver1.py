@@ -3,11 +3,48 @@ import pygame
 import mediapipe as mp
 import numpy as np
 
+def is_valid_quad(corners, min_area=1000, min_angle=35.0):
+    if len(corners) != 4:
+            return False
+            
+     # 면적 검사
+    area = cv2.contourArea(corners)
+    if area < min_area:
+        return False
+            
+    # 각도 검사
+    corners = corners.reshape(-1, 2)
+    angles = []
+    for i in range(4):
+        pt1 = corners[i]
+        pt2 = corners[(i + 1) % 4]
+        pt3 = corners[(i + 2) % 4]
+            
+        # 두 벡터 계산
+        v1 = pt1 - pt2
+        v2 = pt3 - pt2
+            
+        # 각도 계산
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+        angles.append(angle)
+            
+    # 모든 각도가 min_angle보다 커야 함
+    return all(angle >= min_angle and angle <= 180-min_angle for angle in angles)
+
+def preprocess_image(frame):
+    # grayscale + blur
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+    # find edges
+    edges = cv2.Canny(blurred, 30, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(edges, kernel, iterations=2)
+        
+    return dilated
 
 def sort_points(pts):
-    '''
-    sort in the order of: top-left, bot-left, bot-right, top-right
-    '''
     # y좌표로 정렬
     sorted_by_y = pts[np.argsort(pts[:, 1])]
         
@@ -20,7 +57,6 @@ def sort_points(pts):
     bottom_left, bottom_right = bottom_two[np.argsort(bottom_two[:, 0])]
         
     return np.array([top_left, bottom_left, bottom_right, top_right])
-    
 
 # set up pygame
 pygame.init()
@@ -28,12 +64,15 @@ pygame.display.set_caption('Virtual Piano')
 
 screen_w, screen_h = 3456, 2234
 screen = pygame.display.set_mode((screen_w, screen_h), pygame.RESIZABLE)
+piano_layer = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
 black_layer = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
 black_layer.fill((0, 0, 0, 200))
 
-piano = pygame.image.load("/Users/klee9/Desktop/daiv/kirby/imgs/piano_ui.jpg")
-fixed_corners = None
+piano = cv2.imread("/Users/klee9/Desktop/daiv/kirby/piano.jpg")
+piano_h, piano_w, _ = piano.shape
 
+fixed_corners = None
+warped_piano = None
 running = True
 
 # webcam & mediapipe
@@ -54,15 +93,12 @@ while running:
     # preprocess frame
     h, w, _ = frame.shape
 
-    frame = cv2.flip(frame, 1)
+    frame = cv2.flip(frame, 0)
+    #frame = cv2.flip(frame, 1)
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
     hand_layer = np.zeros((h, w, 4), dtype=np.uint8)
     temp_layer = np.zeros((h, w, 4), dtype=np.uint8)
-
-    # mouse position
-    mouse_x, mouse_y = pygame.mouse.get_pos()
-    scaled_mouse_x = int(mouse_x * w / screen_w)
-    scaled_mouse_y = int(mouse_y * h / screen_h)
 
     results = hands.process(frame)
 
@@ -96,15 +132,19 @@ while running:
     hand_layer = cv2.GaussianBlur(hand_layer, (51, 51), 30)
 
     # find contours
+    '''
+    코드가 좀 더러워지긴 했는데요... 최초 1회에 한해서만 피아노 위치를 정할지, 특정 키를 눌렀을 때 수정 가능하도록 바꿀지, 
+    아니면 계속 업데이트 하는 방식으로 할지 정해지면 예쁘게 해 놓을게요 ㅎ
+    '''
     if fixed_corners is None:
-        frame_edges = cv2.Canny(frame, 100, 200)
-        ret, thresh = cv2.threshold(frame_edges, 127, 255, 0)
+        processed_frame = preprocess_image(frame)
+        ret, thresh = cv2.threshold(processed_frame, 127, 255, 0)
         contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
         # find the largest space enclosed by the contours
         largest_contour = max(contours, key=cv2.contourArea)
         largest_area = cv2.contourArea(largest_contour)
-        cv2.drawContours(temp_layer, [largest_contour], -1, (255, 255, 255, 255), 8)
+        cv2.drawContours(frame, [largest_contour], -1, (255, 0, 0, 255), 5)
 
         epsilon = 0.02 * cv2.arcLength(largest_contour, True)
         approx_corners = cv2.approxPolyDP(largest_contour, epsilon, True)
@@ -113,42 +153,42 @@ while running:
         if len(approx_corners) == 4:
             corners = approx_corners.reshape(4, 2)
             corners = sort_points(corners)
-            for corner in corners:
-                cv2.circle(temp_layer, tuple(corner), 5, (255, 0, 0, 255), -1)
 
-            # resize piano
-            img_w = max(piano.get_width(), abs(corners[3,0] - corners[0,0]))
-            img_h = abs(corners[0][1] - corners[1][1])
-            img_scale = (img_w, img_h)
-            piano = pygame.transform.scale(piano, img_scale)
+            if is_valid_quad(corners):                
+                if pygame.key.get_pressed()[pygame.K_p]:
+                    fixed_corners = corners
 
-        for event in pygame.event.get():
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_p:
-                    if fixed_corners is None and len(approx_corners) == 4:
-                        fixed_corners = corners
-                        
-                        print(f"Fixed corners set: {fixed_corners}")
+    else:
+        piano_pts = np.array([
+                            [0, 0],
+                            [0, piano_h],
+                            [piano_w, piano_h],
+                            [piano_w, 0]
+                        ], dtype=np.float32)
+                    
+        doc_pts = np.float32(corners)
 
-            # Key release events (optional)
-            if event.type == pygame.KEYUP:
-                if event.key == pygame.K_p:
-                    print("P key released")
+        # warp perspective
+        matrix = cv2.getPerspectiveTransform(piano_pts, doc_pts)
+        warped_piano = cv2.warpPerspective(piano, matrix, (frame.shape[1], frame.shape[0]))
+        mask = cv2.cvtColor(warped_piano, cv2.COLOR_BGR2GRAY) > 0
+        result = frame.copy()
+        result[mask] = cv2.addWeighted(frame, 0.3, warped_piano, 0.7, 0)[mask]
+        piano_layer = pygame.surfarray.make_surface(result)
+        piano_layer = pygame.transform.rotate(piano_layer, -90)
 
     # create a pygame surface
-    surface = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
+    surface = pygame.surfarray.make_surface(frame)
+    surface = pygame.transform.rotate(surface, -90)
     hand_layer = pygame.image.frombuffer(hand_layer.tobytes(), (w, h), "RGBA")
+    hand_layer = pygame.transform.flip(hand_layer, 1, 0)
     temp_layer = pygame.image.frombuffer(temp_layer.tobytes(), (w, h), "RGBA")
+    temp_layer = pygame.transform.flip(temp_layer, 1, 0)
 
     # stack surfaces
     screen.blit(surface, (0, 0))
-    screen.blit(black_layer, (0, 0))
-
-    # for event in pygame.event.get():
-    #         if event.type == pygame.KEYDOWN:
-    #             if event.key == pygame.K_RETURN:
-    #                 screen.blit(piano, (int((corners[0,0]+corners[3,0])/2)-img_w, corners[0, 1]))
-
+    #screen.blit(black_layer, (0, 0))
+    screen.blit(piano_layer, (0, 0))
     screen.blit(hand_layer, (0, 0))
     screen.blit(temp_layer, (0, 0))
     pygame.display.flip()
@@ -161,9 +201,3 @@ while running:
 # release resources
 cap.release()
 pygame.quit()
-
-'''
-1. find planar object
-2. draw a white outline around it (add glowing effect)
-3. display piano UI
-'''
